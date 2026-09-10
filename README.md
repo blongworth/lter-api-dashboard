@@ -20,11 +20,18 @@ The default cruise is `EN617`. The API is public; no credentials are required.
 
 ## Views
 
-- **Cruise track** — underway data by default, optional shallowest-bottle markers, and an Esri ocean basemap.
-- **Sections** — depth sections by latitude, longitude, or cast, with optional local interpolation and GEBCO bathymetry masking.
-- **Profiles** — single-cast or station profiles. For CTD data, choose bottle chemistry, cast sensor data, or both. Profile tables and endpoint templates appear below each plot.
+**Explore** stacks the three plots on one page, each with its own sidebar controls:
+
+1. **Cruise track** — underway data by default, optional shallowest-bottle markers, and an Esri ocean basemap.
+2. **Sections** — depth sections by latitude, longitude, or cast, from CTD bottles, continuous CTD casts, nutrients, and/or chlorophyll, with optional local interpolation and GEBCO bathymetry masking.
+3. **Profiles** — single-cast or station profiles. For CTD data, choose bottle chemistry, cast sensor data, or both. Profile tables and endpoint templates appear below each plot.
+
+The three are linked: clicking a point on the map or in the section plot selects that cast in the profile plot below. Cast and bottle points identify themselves directly; underway points carry no cast id, so the nearest cast is used. The profile selectors stay available for picking a cast by hand.
+
+The other two views are:
+
 - **Data** — loaded endpoint tables with their API sources.
-- **Metadata panel** — optional CTD metadata, cruise documentation, dataset readmes, and underway column definitions.
+- **Metadata** — optional CTD metadata, cruise documentation, dataset readmes, and underway column definitions.
 
 CTD cast profiles use `ctd/cast/{cruise}/{cast}.csv`; bottle profiles use `ctd/bottles/{cruise}.csv`. Depth is taken from each selected endpoint's `depsm` field.
 

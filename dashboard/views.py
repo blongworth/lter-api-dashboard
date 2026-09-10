@@ -20,6 +20,7 @@ from .config import (
 )
 from .data import (
     cast_plot_data,
+    haversine_km,
     load_cruise_readme,
     load_ctd_metadata,
     load_dataset_readme,
@@ -32,6 +33,96 @@ from .data import (
     temperature_property_index,
     use_endpoint_depth,
 )
+
+
+def cast_label(value: object) -> str:
+    """Render a cast identifier as the API spells it in its endpoint path."""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def selected_cast_from_chart(event: object) -> tuple[str, str] | None:
+    """Read the clicked cruise and cast out of an Altair selection state."""
+    selection = getattr(event, "selection", None)
+    if selection is None and isinstance(event, dict):
+        selection = event.get("selection")
+    points = (selection or {}).get("cast_click") or []
+    if not points:
+        return None
+    point = points[-1]
+    cruise, cast = point.get("cruise"), point.get("cast")
+    if cruise is None or cast is None:
+        return None
+    return str(cruise), cast_label(cast)
+
+
+def selected_cast_from_map(
+    event: object, casts_df: pl.DataFrame, hover_columns: list[str]
+) -> tuple[str, str] | None:
+    """Identify the cast behind a clicked map point. Plotly Express packs the
+    hover columns into customdata in order, so cast points name themselves;
+    underway points and the bottle overlay don't, and fall back to the closest
+    cast by position."""
+    selection = getattr(event, "selection", None)
+    if selection is None and isinstance(event, dict):
+        selection = event.get("selection")
+    points = (selection or {}).get("points") or []
+    if not points:
+        return None
+    point = points[-1]
+    custom = point.get("customdata") or []
+
+    def hover_value(*names: str) -> object | None:
+        for name in names:
+            if name in hover_columns and hover_columns.index(name) < len(custom):
+                value = custom[hover_columns.index(name)]
+                if value is not None:
+                    return value
+        return None
+
+    cruise = hover_value("cruise", "cruise_name")
+    cast = hover_value("cast", "number")
+    if cruise is not None and cast is not None:
+        return str(cruise), cast_label(cast)
+    lat = point.get("lat", point.get("y"))
+    lon = point.get("lon", point.get("x"))
+    if lat is None or lon is None:
+        return None
+    return nearest_cast(casts_df, float(lat), float(lon))
+
+
+def nearest_cast(
+    casts_df: pl.DataFrame, lat: float, lon: float
+) -> tuple[str, str] | None:
+    """Identify the cast closest to a clicked location."""
+    keys = ["cruise_name", "number", "latitude", "longitude"]
+    if casts_df.is_empty() or not set(keys).issubset(casts_df.columns):
+        return None
+    locations = (
+        casts_df.select(keys).drop_nulls().unique(["cruise_name", "number"]).to_dicts()
+    )
+    if not locations:
+        return None
+    closest = min(
+        locations,
+        key=lambda row: haversine_km(lat, lon, row["latitude"], row["longitude"]),
+    )
+    return str(closest["cruise_name"]), str(closest["number"])
+
+
+def latest_click(clicks: dict[str, tuple[str, str] | None]) -> tuple[str, str] | None:
+    """Return the cast whose chart selection changed on this rerun. A chart keeps
+    reporting its last selection, so without this a stale section selection would
+    outvote a fresh map click."""
+    newest = None
+    for source, clicked in clicks.items():
+        state_key = f"last_click_{source}"
+        if clicked != st.session_state.get(state_key):
+            st.session_state[state_key] = clicked
+            if clicked:
+                newest = clicked
+    return newest
 
 
 def endpoint_display(template: str, cruises: tuple[str, ...]) -> str:
@@ -187,7 +278,7 @@ def render_track(
     dataset: str,
     map_source: str,
     cruises: tuple[str, ...],
-) -> None:
+) -> tuple[str, str] | None:
     with st.container(border=True):
         st.subheader("Underway track, stations, and bathymetry")
         source_data = {
@@ -236,23 +327,24 @@ def render_track(
         color_column = "cruise_name" if "cruise_name" in track.columns else "cruise"
         if color_choice != "Cruise" and color_choice in track.columns:
             color_column = color_choice
+        hover_columns = [
+            c
+            for c in [
+                "cruise",
+                "cruise_name",
+                "number",
+                "cast",
+                "date",
+                color_choice,
+            ]
+            if c in track.columns
+        ]
         fig = px.scatter_map(
             track,
             lat="latitude",
             lon="longitude",
             color=color_column if color_column in track.columns else None,
-            hover_data=[
-                c
-                for c in [
-                    "cruise",
-                    "cruise_name",
-                    "number",
-                    "cast",
-                    "date",
-                    color_choice,
-                ]
-                if c in track.columns
-            ],
+            hover_data=hover_columns,
             color_continuous_scale="Viridis" if color_column == color_choice else None,
             zoom=6,
             height=700,
@@ -325,7 +417,14 @@ def render_track(
         fig.update_layout(
             margin={"l": 0, "r": 0, "t": 0, "b": 0}, legend={"orientation": "h"}
         )
-        st.plotly_chart(fig, width="stretch")
+        st.caption("Click a location to show the nearest cast in the profile below.")
+        event = st.plotly_chart(
+            fig,
+            key="map_chart",
+            on_select="rerun",
+            selection_mode="points",
+            width="stretch",
+        )
         endpoint_template = {
             "Underway": f"{API_BASE}/underway/{{cruise}}.csv",
             "CTD": f"{API_BASE}/ctd/casts/{{cruise}}.csv",
@@ -337,14 +436,25 @@ def render_track(
             "map_plot",
             "nes_lter_map_data.csv",
         )
+    return selected_cast_from_map(event, casts_df, hover_columns)
 
 
-def render_section(data_df: pl.DataFrame, dataset: str, selected: list[str]) -> None:
-    dataset_names = [name for name in DATASET_SPECS if name in dataset.split(", ")]
-    dataset_names = dataset_names or [next(iter(DATASET_SPECS))]
+def render_section(
+    data_df: pl.DataFrame, dataset: str, selected: list[str]
+) -> tuple[str, str] | None:
+    selected_names = dataset.split(", ")
+    dataset_names = [name for name in DATASET_SPECS if name in selected_names]
+    include_casts = "CTD casts" in selected_names
+    if not dataset_names and not include_casts:
+        dataset_names = [next(iter(DATASET_SPECS))]
     with st.container(border=True):
         st.subheader(f"Sections from {dataset}")
-        st.caption("; ".join(DATASET_SPECS[name].depth_note for name in dataset_names))
+        notes = [DATASET_SPECS[name].depth_note for name in dataset_names]
+        if include_casts:
+            notes.append(
+                "Depth for CTD casts uses the sensor profile's `depsm`/`prdm` field."
+            )
+        st.caption("; ".join(notes))
         if data_df.is_empty() or "depth" not in data_df.columns:
             st.warning(f"No {dataset} data with depth were available.")
             return
@@ -402,12 +512,16 @@ def render_section(data_df: pl.DataFrame, dataset: str, selected: list[str]) -> 
         if not bathy.is_empty():
             bottom = max(bottom, float(bathy["bathymetry"].max()))
         y_scale = alt.Scale(domain=[0, max(bottom * 1.02, 1.0)])
+        x_scale = alt.Scale(reverse=x_axis == "latitude")
+        selectable = {"cruise", "cast"}.issubset(section_df.columns)
         points = (
             alt.Chart(section_df)
             .mark_circle(size=70, opacity=0.85)
             .encode(
                 x=alt.X(
-                    f"{x_axis}:{'N' if x_axis == 'cast' else 'Q'}", title=x_axis.title()
+                    f"{x_axis}:{'N' if x_axis == 'cast' else 'Q'}",
+                    title=x_axis.title(),
+                    scale=x_scale,
                 ),
                 y=alt.Y("depth:Q", title="Depth (m)", sort="descending", scale=y_scale),
                 color=alt.Color(f"{variable}:Q", scale=alt.Scale(scheme="viridis")),
@@ -427,6 +541,15 @@ def render_section(data_df: pl.DataFrame, dataset: str, selected: list[str]) -> 
                 ],
             )
         )
+        if selectable:
+            points = points.add_params(
+                alt.selection_point(
+                    name="cast_click",
+                    fields=["cruise", "cast"],
+                    on="click",
+                    clear="dblclick",
+                )
+            )
         layers = []
         if interpolate and not bathy.is_empty():
             interpolated = mask_interpolation_by_bathymetry(
@@ -437,7 +560,7 @@ def render_section(data_df: pl.DataFrame, dataset: str, selected: list[str]) -> 
                     alt.Chart(interpolated)
                     .mark_rect()
                     .encode(
-                        x=alt.X(f"{x_axis}:Q"),
+                        x=alt.X(f"{x_axis}:Q", scale=x_scale),
                         y=alt.Y("depth:Q", sort="descending", scale=y_scale),
                         color=alt.Color(
                             f"{variable}:Q", scale=alt.Scale(scheme="viridis")
@@ -454,25 +577,39 @@ def render_section(data_df: pl.DataFrame, dataset: str, selected: list[str]) -> 
                 alt.Chart(bathy_plot)
                 .mark_area(color="#6b7280", opacity=0.35)
                 .encode(
-                    x=alt.X(f"{x_axis}:Q"),
+                    x=alt.X(f"{x_axis}:Q", scale=x_scale),
                     y=alt.Y("bathymetry:Q", sort="descending", scale=y_scale),
                     y2="section_bottom:Q",
                 ),
             )
-        st.altair_chart(
-            alt.layer(*layers).interactive().properties(height=620), width="stretch"
-        )
+        chart = alt.layer(*layers).interactive().properties(height=620)
+        if selectable:
+            st.caption("Click a point to show that cast in the profile below.")
+            event = st.altair_chart(
+                chart,
+                key="section_chart",
+                on_select="rerun",
+                width="stretch",
+            )
+        else:
+            event = None
+            st.altair_chart(chart, width="stretch")
         endpoints = [
             f"{API_BASE}/{DATASET_SPECS[name].endpoint.format(cruise=cruise)}"
             for name in dataset_names
             for cruise in (cruises or selected)
         ]
+        if include_casts:
+            endpoints.append(
+                f"{API_BASE}/ctd/cast/{{cruise}}/{{cast}}.csv (one endpoint per cast)"
+            )
         render_plot_data(
             section_df,
             endpoints,
             "section_plot",
             "nes_lter_section_data.csv",
         )
+    return selected_cast_from_chart(event)
 
 
 def render_profile(
@@ -482,6 +619,7 @@ def render_profile(
     casts_df: pl.DataFrame,
     bottle_df: pl.DataFrame,
     profile_source: str = "Bottles",
+    focus_cast: tuple[str, str] | None = None,
 ) -> None:
     with st.container(border=True):
         st.subheader(f"Single-station profiles from {dataset}")
@@ -509,6 +647,9 @@ def render_profile(
             if "cruise" in data_df.columns
             else selected
         )
+        if focus_cast and focus_cast[0] in cruises:
+            st.session_state["profile_cruise"] = focus_cast[0]
+            st.session_state["profile_selector_type"] = "Cast"
         with st.container(horizontal=True, vertical_alignment="bottom"):
             cruise = st.selectbox("Profile cruise", cruises, key="profile_cruise")
             subset = (
@@ -551,6 +692,8 @@ def render_profile(
                     f"No {selector_type.lower()} values are available for profiles."
                 )
                 return
+            if focus_cast and selector_type == "Cast" and focus_cast[1] in values:
+                st.session_state["profile_selector_value"] = focus_cast[1]
             selected_profile = st.selectbox(
                 f"Profile {selector_type.lower()}", values, key="profile_selector_value"
             )

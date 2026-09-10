@@ -503,7 +503,13 @@ def load_datasets(
     """Load and combine multiple compatible depth-oriented datasets."""
     frames = []
     for dataset in datasets:
-        data = load_dataset(cruise_names, dataset)
+        data = (
+            add_temperature_property(
+                cast_plot_data(load_casts(cruise_names)), bottle=True
+            )
+            if dataset == "CTD casts"
+            else load_dataset(cruise_names, dataset)
+        )
         if not data.is_empty():
             frames.append(data.with_columns(pl.lit(dataset).alias("data_source")))
     return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
